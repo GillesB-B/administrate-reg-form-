@@ -27,7 +27,7 @@ export const handler = async (req) => {
   `;
 
   const GET_EVENT_BY_ID = `
-    query GetEventById($id: ID!) {
+    query GetEventById($id: String!) {
       events(filters: [{ field: id, operation: eq, value: $id }]) {
         edges { node { id code legacyId title start end learningMode } }
       }
