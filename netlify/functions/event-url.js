@@ -121,7 +121,7 @@ export const handler = async (req) => {
     // 5) Upsert into your Event custom field (apiName must match your Admin setup)
     const up = await gql(UPSERT_EVENT_CUSTOM_FIELD, {
       eventId: eventNode.id,             // NOTE: this is ID! for the mutation
-      apiName: "nr-public-url",          // <-- change if your field is named differently
+      apiName: "cf-public-url",          // <-- change if your field is named differently
       value: publicUrl
     });
 
