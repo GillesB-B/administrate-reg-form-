@@ -1,11 +1,10 @@
 // netlify/functions/event-url.js
-// CommonJS export to avoid ESM issues on Netlify
 exports.handler = async (req) => {
   const ORIGIN = process.env.ALLOWED_ORIGIN || "*";
   const endpoint = process.env.ADMINISTRATE_GRAPHQL_ENDPOINT;
-  const token = process.env.ADMINISTRATE_API_TOKEN; // current access token
+  const token = process.env.ADMINISTRATE_API_TOKEN;
   const SITE_BASE = process.env.PUBLIC_SITE_BASE || "";
-  const PUBLIC_URL_CF_DEFINITION_KEY = process.env.PUBLIC_URL_CF_DEFINITION_KEY; // <-- set this in Netlify
+  const PUBLIC_URL_CF_DEFINITION_KEY = process.env.PUBLIC_URL_CF_DEFINITION_KEY;
 
   const resp = (status, body) => ({
     statusCode: status,
@@ -20,32 +19,31 @@ exports.handler = async (req) => {
     return resp(500, { error: "Missing ADMINISTRATE_GRAPHQL_ENDPOINT or ADMINISTRATE_API_TOKEN" });
   }
   if (!PUBLIC_URL_CF_DEFINITION_KEY) {
-    return resp(500, { error: "Missing PUBLIC_URL_CF_DEFINITION_KEY env var (custom field definitionKey/ID)" });
+    return resp(500, { error: "Missing PUBLIC_URL_CF_DEFINITION_KEY env var" });
   }
 
-  // Parse payload (webhook) and query params for manual testing
+  // Parse payload
   let payload = {};
   try { payload = JSON.parse(req.body || "{}"); } catch {}
-  const urlObj = new URL(req.rawUrl || `https://example.com${req.path}?${req.queryStringParameters || ""}`);
-const qpEventId = urlObj.searchParams.get("eventId"); // manual GraphQL id test
-const qpCode    = urlObj.searchParams.get("code");    // manual code test
 
-// Your webhook sends a numeric id and a code; we'll use the code from payload
-const payloadCode =
-  (payload && payload.event && payload.event.code) ||
-  (payload && payload.payload && payload.payload.event && payload.payload.event.code) ||
-  (payload && payload.entity && payload.entity.code) ||
-  (payload && payload.code) ||
-  null;
+  // Helper to turn numeric ID into GraphQL node ID
+  const toGraphId = (num) => Buffer.from(`Event:${num}`, "utf8").toString("base64");
 
-// Choose resolver: if you explicitly pass ?eventId= use that; else use code
-const resolver = qpEventId ? "id" : "code";
-const resolverValue = qpEventId || qpCode || payloadCode;
+  const urlObj = new URL(req.rawUrl || `https://example.com`);
+  const qpGraphId = urlObj.searchParams.get("id");
+  const numericFromPayload = payload?.payload?.event?.id || payload?.event?.id || null;
+  const graphIdFromNumeric = numericFromPayload ? toGraphId(numericFromPayload) : null;
 
-if (!resolverValue) {
-  return resp(400, { error: "No usable event identifier. Provide ?eventId=<GraphQL ID> or ensure payload.event.code is present." });
-}
+  const eventGraphId = qpGraphId || graphIdFromNumeric;
 
+  if (!eventGraphId) {
+    return resp(400, {
+      error: "No event ID found",
+      hint: "Manual Event Webhook sends payload.payload.event.id (numeric). For manual tests, pass ?id=<GraphQL ID>."
+    });
+  }
+
+  // GraphQL helper
   async function gql(query, variables) {
     const r = await fetch(endpoint, {
       method: "POST",
@@ -60,16 +58,15 @@ if (!resolverValue) {
     return json.data;
   }
 
-  // Filters expect String values
-const GET_EVENT_BY_CODE = `
-  query GetEventByCode($code: String!) {
-    events(filters: [{ field: code, operation: eq, value: $code }]) {
-      edges { node { id code title } }
+  // Query by GraphQL ID
+  const GET_EVENT_BY_ID = `
+    query GetEventById($id: ID!) {
+      events(filters: [{ field: id, operation: eq, value: $id }]) {
+        edges { node { id legacyId code title } }
+      }
     }
-  }
-`;
+  `;
 
-  // Correct mutation shape for your tenant: update(eventId: ..., input: { customFieldValues: [{ definitionKey, value }] })
   const UPDATE_EVENT_CF = `
     mutation UpdateEventCF($eventId: ID!, $definitionKey: ID!, $value: String!) {
       event {
@@ -84,29 +81,22 @@ const GET_EVENT_BY_CODE = `
   `;
 
   try {
-    // Resolve event node
-    let node = null;
-if (resolver === "id") {
-  const d = await gql(GET_EVENT_BY_ID, { id: resolverValue });
-  node = (d && d.events && d.events.edges && d.events.edges[0] && d.events.edges[0].node) || null;
-} else {
-  const d = await gql(GET_EVENT_BY_CODE, { code: resolverValue });
-  node = (d && d.events && d.events.edges && d.events.edges[0] && d.events.edges[0].node) || null;
-}
+    const d = await gql(GET_EVENT_BY_ID, { id: eventGraphId });
+    const node = d?.events?.edges?.[0]?.node;
     if (!node) return resp(404, { error: "Event not found" });
 
-    // Build public URL (prefer legacyId, then code, then id)
-const base = SITE_BASE || urlObj.origin;
-const publicUrl = `${base}/?id=${encodeURIComponent(node.id)}`;
+    // Build the public URL using GraphQL ID
+    const base = SITE_BASE || urlObj.origin;
+    const publicUrl = `${base}/?id=${encodeURIComponent(node.id)}`;
 
-    // Update custom field using definitionKey
+    // Update the event’s custom field
     const result = await gql(UPDATE_EVENT_CF, {
       eventId: node.id,
       definitionKey: PUBLIC_URL_CF_DEFINITION_KEY,
       value: publicUrl
     });
-    const update = result && result.event && result.event.update;
-    const errors = update && update.errors;
+
+    const errors = result?.event?.update?.errors;
     if (errors && errors.length) {
       return resp(400, { error: "Custom field update error", details: errors, publicUrl });
     }
@@ -114,8 +104,6 @@ const publicUrl = `${base}/?id=${encodeURIComponent(node.id)}`;
     return resp(200, {
       status: "success",
       eventId: node.id,
-      legacyId: node.legacyId,
-      code: node.code,
       publicUrl
     });
   } catch (e) {
