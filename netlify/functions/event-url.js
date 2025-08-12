@@ -1,5 +1,5 @@
 // netlify/functions/event-url.js
-export const handler = async (req) => {
+exports.handler = async (req) => {
   const ORIGIN = process.env.ALLOWED_ORIGIN || "*";
   const endpoint = process.env.ADMINISTRATE_GRAPHQL_ENDPOINT;
   const token = process.env.ADMINISTRATE_API_TOKEN; // access token (we can add refresh later)
