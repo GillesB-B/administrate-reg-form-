@@ -1,11 +1,10 @@
 // netlify/functions/event-url.js
-// CommonJS export to avoid ESM issues on Netlify
 exports.handler = async (req) => {
   const ORIGIN = process.env.ALLOWED_ORIGIN || "*";
   const endpoint = process.env.ADMINISTRATE_GRAPHQL_ENDPOINT;
-  const token = process.env.ADMINISTRATE_API_TOKEN; // current access token
+  const token = process.env.ADMINISTRATE_API_TOKEN;
   const SITE_BASE = process.env.PUBLIC_SITE_BASE || "";
-  const PUBLIC_URL_CF_DEFINITION_KEY = process.env.PUBLIC_URL_CF_DEFINITION_KEY; // <-- set this in Netlify (Custom Field definitionKey/ID)
+  const PUBLIC_URL_CF_DEFINITION_KEY = process.env.PUBLIC_URL_CF_DEFINITION_KEY;
 
   const resp = (status, body) => ({
     statusCode: status,
@@ -20,30 +19,32 @@ exports.handler = async (req) => {
     return resp(500, { error: "Missing ADMINISTRATE_GRAPHQL_ENDPOINT or ADMINISTRATE_API_TOKEN" });
   }
   if (!PUBLIC_URL_CF_DEFINITION_KEY) {
-    return resp(500, { error: "Missing PUBLIC_URL_CF_DEFINITION_KEY env var (custom field definitionKey/ID)" });
+    return resp(500, { error: "Missing PUBLIC_URL_CF_DEFINITION_KEY env var" });
   }
 
-  // ---------------------------
-  // NEW ID EXTRACTION + LOOKUP
-  // ---------------------------
-
-  // Parse payload (manual webhook sends numeric ID in payload.event.id)
+  // Parse payload
   let payload = {};
   try { payload = JSON.parse(req.body || "{}"); } catch {}
 
   const urlObj = new URL(req.rawUrl || `https://example.com${req.path}?${req.queryStringParameters || ""}`);
-
-  // For browser/manual testing: pass GraphQL ID via ?id=Q291cnNlOjE=
   const qpGraphId = urlObj.searchParams.get("id");
 
-  // For manual webhook payload: numeric ID from Administrate (e.g. 456)
+  // From webhook payload: numeric ID
   const numericIdFromPayload =
     payload?.payload?.event?.id ??
     payload?.event?.id ??
-    payload?.data?.event?.id ??
     null;
 
-  // GraphQL query helper
+  // Convert numeric ID to GraphQL ID
+  const toGraphId = (num) => Buffer.from(`Event:${num}`, "utf8").toString("base64");
+
+  const eventIdToUse = qpGraphId || (numericIdFromPayload ? toGraphId(numericIdFromPayload) : null);
+
+  if (!eventIdToUse) {
+    return resp(400, { error: "No event ID found" });
+  }
+
+  // Query helpers
   async function gql(query, variables) {
     const r = await fetch(endpoint, {
       method: "POST",
@@ -58,18 +59,7 @@ exports.handler = async (req) => {
     return json.data;
   }
 
-  // Query by GraphQL ID (node lookup)
-  const GET_BY_NODE = `
-    query($id: ID!) {
-      node(id: $id) { 
-        id 
-        ... on Event { id code legacyId title } 
-      }
-    }
-  `;
-
-  // Query by numeric ID (Events filter on id field)
-  const GET_BY_NUMERIC_ID = `
+  const GET_EVENT_BY_ID = `
     query($id: String!) {
       events(filters: [{ field: id, operation: eq, value: $id }]) {
         edges { node { id code legacyId title } }
@@ -77,23 +67,6 @@ exports.handler = async (req) => {
     }
   `;
 
-  // Resolve the event node
-  let node = null;
-  if (qpGraphId) {
-    const d = await gql(GET_BY_NODE, { id: qpGraphId });
-    node = d?.node ?? null;
-  } else if (numericIdFromPayload != null) {
-    const d = await gql(GET_BY_NUMERIC_ID, { id: String(numericIdFromPayload) });
-    node = d?.events?.edges?.[0]?.node ?? null;
-  } else {
-    return resp(400, { error: "No event id found. Use ?id=<GraphQL ID> for testing, or trigger from the Administrate UI." });
-  }
-
-  if (!node || !node.id) {
-    return resp(404, { error: "Event not found" });
-  }
-
-  // Mutation to update custom field on Event
   const UPDATE_EVENT_CF = `
     mutation UpdateEventCF($eventId: ID!, $definitionKey: ID!, $value: String!) {
       event {
@@ -107,19 +80,26 @@ exports.handler = async (req) => {
     }
   `;
 
-  // Build public URL (always use GraphQL ID for uniqueness)
+  // Get event
+  const d = await gql(GET_EVENT_BY_ID, { id: eventIdToUse });
+  const node = d?.events?.edges?.[0]?.node || null;
+
+  if (!node) {
+    return resp(404, { error: "Event not found" });
+  }
+
+  // Always use GraphQL ID in URL
   const base = SITE_BASE || urlObj.origin;
   const publicUrl = `${base}/?id=${encodeURIComponent(node.id)}`;
 
-  // Update custom field using definitionKey (as per Administrate docs)
+  // Update CF
   const result = await gql(UPDATE_EVENT_CF, {
     eventId: node.id,
     definitionKey: PUBLIC_URL_CF_DEFINITION_KEY,
     value: publicUrl
   });
 
-  const update = result?.event?.update;
-  const errors = update?.errors;
+  const errors = result?.event?.update?.errors;
   if (errors && errors.length) {
     return resp(400, { error: "Custom field update error", details: errors, publicUrl });
   }
