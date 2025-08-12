@@ -40,6 +40,19 @@ exports.handler = async (req) => {
 
   const eventIdToUse = qpGraphId || (numericIdFromPayload ? toGraphId(numericIdFromPayload) : null);
 
+  // ---------------------------
+  // DEBUG LOGGING
+  // ---------------------------
+  console.log("=== DEBUG: Incoming Webhook/Event Data ===");
+  console.log("Raw Payload:", JSON.stringify(payload, null, 2));
+  console.log("Numeric ID from Payload:", numericIdFromPayload);
+  if (numericIdFromPayload) {
+    console.log("Generated GraphQL ID:", toGraphId(numericIdFromPayload));
+  }
+  console.log("Query Param GraphQL ID (if any):", qpGraphId);
+  console.log("Final Event ID Used in Query:", eventIdToUse);
+  // ---------------------------
+
   if (!eventIdToUse) {
     return resp(400, { error: "No event ID found" });
   }
@@ -55,7 +68,10 @@ exports.handler = async (req) => {
       body: JSON.stringify({ query, variables })
     });
     const json = await r.json().catch(() => ({}));
-    if (json.errors) throw new Error(JSON.stringify(json.errors));
+    if (json.errors) {
+      console.error("GraphQL Errors:", json.errors);
+      throw new Error(JSON.stringify(json.errors));
+    }
     return json.data;
   }
 
@@ -81,16 +97,22 @@ exports.handler = async (req) => {
   `;
 
   // Get event
+  console.log("Querying event with ID:", eventIdToUse);
   const d = await gql(GET_EVENT_BY_ID, { id: eventIdToUse });
+  console.log("GraphQL Query Response:", JSON.stringify(d, null, 2));
+
   const node = d?.events?.edges?.[0]?.node || null;
 
   if (!node) {
+    console.error("Event not found for ID:", eventIdToUse);
     return resp(404, { error: "Event not found" });
   }
 
   // Always use GraphQL ID in URL
   const base = SITE_BASE || urlObj.origin;
   const publicUrl = `${base}/?id=${encodeURIComponent(node.id)}`;
+
+  console.log("Generated Public URL:", publicUrl);
 
   // Update CF
   const result = await gql(UPDATE_EVENT_CF, {
@@ -99,8 +121,11 @@ exports.handler = async (req) => {
     value: publicUrl
   });
 
+  console.log("Update CF Response:", JSON.stringify(result, null, 2));
+
   const errors = result?.event?.update?.errors;
   if (errors && errors.length) {
+    console.error("Custom Field Update Errors:", errors);
     return resp(400, { error: "Custom field update error", details: errors, publicUrl });
   }
 
