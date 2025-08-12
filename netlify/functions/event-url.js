@@ -2,10 +2,9 @@
 export const handler = async (req) => {
   const ORIGIN = process.env.ALLOWED_ORIGIN || "*";
   const endpoint = process.env.ADMINISTRATE_GRAPHQL_ENDPOINT;
-  const token = process.env.ADMINISTRATE_API_TOKEN; // access token (temporary until we add refresh)
-  const SITE_BASE = process.env.PUBLIC_SITE_BASE || ""; // optional override like https://your-domain.com
+  const token = process.env.ADMINISTRATE_API_TOKEN; // access token (we can add refresh later)
+  const SITE_BASE = process.env.PUBLIC_SITE_BASE || "";
 
-  // Small helper for consistent responses
   const resp = (status, body) => ({
     statusCode: status,
     headers: {
@@ -19,12 +18,14 @@ export const handler = async (req) => {
     return resp(500, { error: "Missing ADMINISTRATE_GRAPHQL_ENDPOINT or ADMINISTRATE_API_TOKEN" });
   }
 
-  // 1) Parse payload (Administrate sends JSON); also allow manual testing via query params
+  // Parse JSON body (webhook) + allow manual test via query params
   let payload = {};
-  try { payload = JSON.parse(req.body || "{}"); } catch { payload = {}; }
+  try { payload = JSON.parse(req.body || "{}"); } catch {}
+  const url = new URL(req.rawUrl || `https://example.com${req.path}?${req.queryStringParameters || ""}`);
+  const qpEventId = url.searchParams.get("eventId");
+  const qpLegacyId = url.searchParams.get("legacyId");
 
-  // Try common webhook shapes to extract an event GraphQL ID
-  let eventIdFromPayload =
+  const eventIdFromPayload =
     payload?.event?.id ||
     payload?.payload?.event?.id ||
     payload?.entity?.id ||
@@ -32,12 +33,6 @@ export const handler = async (req) => {
     payload?.id ||
     null;
 
-  // Support manual test: ?eventId=<GraphQL ID> or ?legacyId=123
-  const u = new URL(req.rawUrl || `https://example.com${req.path}?${req.queryStringParameters || ""}`);
-  const qpEventId = u.searchParams.get("eventId");
-  const qpLegacyId = u.searchParams.get("legacyId");
-
-  // 2) GraphQL helper
   async function gql(query, variables) {
     const r = await fetch(endpoint, {
       method: "POST",
@@ -48,13 +43,11 @@ export const handler = async (req) => {
       body: JSON.stringify({ query, variables })
     });
     const json = await r.json().catch(() => ({}));
-    if (json.errors) {
-      throw new Error(JSON.stringify(json.errors));
-    }
+    if (json.errors) throw new Error(JSON.stringify(json.errors));
     return json.data;
   }
 
-  // Queries: note the filter `value` expects a String
+  // Filters expect String values
   const GET_EVENT_BY_ID = `
     query GetEventById($id: String!) {
       events(filters: [{ field: id, operation: eq, value: $id }]) {
@@ -70,17 +63,15 @@ export const handler = async (req) => {
     }
   `;
 
-  // Mutation: write the URL into your Event custom field
-  // Change apiName if your field is named differently
-  const UPSERT_EVENT_CUSTOM_FIELD = `
-    mutation UpsertEventField($eventId: ID!, $apiName: String!, $value: String!) {
-      training {
-        eventCustomFieldValueUpsert(input: {
-          eventId: $eventId,
-          apiName: $apiName,
-          value: $value
+  // ✅ Use event.update, not training{...}
+  const UPDATE_EVENT_CF = `
+    mutation UpdateEventCF($eventId: ID!, $apiName: String!, $value: String!) {
+      event {
+        update(input: {
+          id: $eventId,
+          customFieldValues: [{ apiName: $apiName, value: $value }]
         }) {
-          customFieldValue { apiName value }
+          event { id }
           errors { label message value }
         }
       }
@@ -88,56 +79,36 @@ export const handler = async (req) => {
   `;
 
   try {
-    // 3) Resolve the event node we’re working with
-    let eventNode = null;
-
+    // Resolve event
+    let node = null;
     if (qpLegacyId) {
       const d = await gql(GET_EVENT_BY_LEGACY_ID, { legacyId: qpLegacyId });
-      eventNode = d?.events?.edges?.[0]?.node || null;
+      node = d?.events?.edges?.[0]?.node || null;
     } else {
       const idToUse = qpEventId || eventIdFromPayload;
-      if (!idToUse) {
-        return resp(400, { error: "No event id found. Provide ?eventId=<GraphQL ID> or ?legacyId=<legacyId> for manual testing." });
-      }
+      if (!idToUse) return resp(400, { error: "No event id. Use ?eventId=<GraphQL ID> or ?legacyId=<legacyId>." });
       const d = await gql(GET_EVENT_BY_ID, { id: idToUse });
-      eventNode = d?.events?.edges?.[0]?.node || null;
+      node = d?.events?.edges?.[0]?.node || null;
     }
+    if (!node) return resp(404, { error: "Event not found" });
 
-    if (!eventNode) {
-      return resp(404, { error: "Event not found" });
-    }
-
-    // 4) Build the public URL (prefer legacyId, then code, then id)
-    const base = SITE_BASE || new URL(req.rawUrl).origin; // ensures we write your site’s domain
+    // Build public URL
+    const base = SITE_BASE || url.origin;
     let publicUrl = "";
-    if (eventNode.legacyId) {
-      publicUrl = `${base}/?legacyId=${encodeURIComponent(eventNode.legacyId)}`;
-    } else if (eventNode.code) {
-      publicUrl = `${base}/e/${encodeURIComponent(eventNode.code)}`;
-    } else {
-      publicUrl = `${base}/?id=${encodeURIComponent(eventNode.id)}`;
-    }
+    if (node.legacyId) publicUrl = `${base}/?legacyId=${encodeURIComponent(node.legacyId)}`;
+    else if (node.code) publicUrl = `${base}/e/${encodeURIComponent(node.code)}`;
+    else publicUrl = `${base}/?id=${encodeURIComponent(node.id)}`;
 
-    // 5) Upsert into your Event custom field (apiName must match your Admin setup)
-    const up = await gql(UPSERT_EVENT_CUSTOM_FIELD, {
-      eventId: eventNode.id,             // NOTE: this is ID! for the mutation
-      apiName: "cf-public-url",          // <-- change if your field is named differently
+    // Write to your Event custom field (API name must match your setup)
+    const up = await gql(UPDATE_EVENT_CF, {
+      eventId: node.id,
+      apiName: "publicUrl", // <-- CHANGE THIS to your Event field's API name
       value: publicUrl
     });
+    const errs = up?.event?.update?.errors;
+    if (errs && errs.length) return resp(400, { error: "Custom field update error", details: errs, publicUrl });
 
-    const errs = up?.training?.eventCustomFieldValueUpsert?.errors;
-    if (errs && errs.length) {
-      return resp(400, { error: "Custom field upsert error", details: errs, publicUrl });
-    }
-
-    return resp(200, {
-      status: "success",
-      eventId: eventNode.id,
-      legacyId: eventNode.legacyId,
-      code: eventNode.code,
-      publicUrl
-    });
-
+    return resp(200, { status: "success", eventId: node.id, legacyId: node.legacyId, code: node.code, publicUrl });
   } catch (e) {
     return resp(500, { error: String(e) });
   }
