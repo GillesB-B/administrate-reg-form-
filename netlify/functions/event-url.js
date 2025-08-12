@@ -64,19 +64,18 @@ export const handler = async (req) => {
   `;
 
   // ✅ Use event.update, not training{...}
-  const UPDATE_EVENT_CF = `
-    mutation UpdateEventCF($eventId: ID!, $apiName: String!, $value: String!) {
-      event {
-        update(input: {
-          id: $eventId,
-          customFieldValues: [{ apiName: $apiName, value: $value }]
-        }) {
-          event { id }
-          errors { label message value }
-        }
+const UPDATE_EVENT_CF = `
+  mutation UpdateEventCF($eventId: ID!, $definitionKey: ID!, $value: String!) {
+    event {
+      update(eventId: $eventId, input: {
+        customFieldValues: [{ definitionKey: $definitionKey, value: $value }]
+      }) {
+        event { id }
+        errors { label message value }
       }
     }
-  `;
+  }
+`;
 
   try {
     // Resolve event
@@ -100,11 +99,12 @@ export const handler = async (req) => {
     else publicUrl = `${base}/?id=${encodeURIComponent(node.id)}`;
 
     // Write to your Event custom field (API name must match your setup)
-    const up = await gql(UPDATE_EVENT_CF, {
-      eventId: node.id,
-      apiName: "publicUrl", // <-- CHANGE THIS to your Event field's API name
-      value: publicUrl
-    });
+const up = await gql(UPDATE_EVENT_CF, {
+  eventId: node.id,
+  definitionKey: process.env.PUBLIC_URL_CF_DEFINITION_KEY, // <-- uses your env var
+  value: publicUrl
+});
+const errs = up?.event?.update?.errors;
     const errs = up?.event?.update?.errors;
     if (errs && errs.length) return resp(400, { error: "Custom field update error", details: errs, publicUrl });
 
