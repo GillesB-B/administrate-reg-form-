@@ -27,16 +27,24 @@ exports.handler = async (req) => {
   let payload = {};
   try { payload = JSON.parse(req.body || "{}"); } catch {}
   const urlObj = new URL(req.rawUrl || `https://example.com${req.path}?${req.queryStringParameters || ""}`);
-  const qpEventId = urlObj.searchParams.get("eventId");
-  const qpLegacyId = urlObj.searchParams.get("legacyId");
+const qpEventId = urlObj.searchParams.get("eventId"); // manual GraphQL id test
+const qpCode    = urlObj.searchParams.get("code");    // manual code test
 
-  const eventIdFromPayload =
-    (payload && (payload.event && payload.event.id)) ||
-    (payload && payload.payload && payload.payload.event && payload.payload.event.id) ||
-    (payload && payload.entity && payload.entity.id) ||
-    (payload && payload.data && payload.data.event && payload.data.event.id) ||
-    payload.id ||
-    null;
+// Your webhook sends a numeric id and a code; we'll use the code from payload
+const payloadCode =
+  (payload && payload.event && payload.event.code) ||
+  (payload && payload.payload && payload.payload.event && payload.payload.event.code) ||
+  (payload && payload.entity && payload.entity.code) ||
+  (payload && payload.code) ||
+  null;
+
+// Choose resolver: if you explicitly pass ?eventId= use that; else use code
+const resolver = qpEventId ? "id" : "code";
+const resolverValue = qpEventId || qpCode || payloadCode;
+
+if (!resolverValue) {
+  return resp(400, { error: "No usable event identifier. Provide ?eventId=<GraphQL ID> or ensure payload.event.code is present." });
+}
 
   async function gql(query, variables) {
     const r = await fetch(endpoint, {
@@ -53,20 +61,13 @@ exports.handler = async (req) => {
   }
 
   // Filters expect String values
-  const GET_EVENT_BY_ID = `
-    query GetEventById($id: String!) {
-      events(filters: [{ field: id, operation: eq, value: $id }]) {
-        edges { node { id legacyId code title } }
-      }
+const GET_EVENT_BY_CODE = `
+  query GetEventByCode($code: String!) {
+    events(filters: [{ field: code, operation: eq, value: $code }]) {
+      edges { node { id code title } }
     }
-  `;
-  const GET_EVENT_BY_LEGACY_ID = `
-    query GetEventByLegacyId($legacyId: String!) {
-      events(filters: [{ field: legacyId, operation: eq, value: $legacyId }]) {
-        edges { node { id legacyId code title } }
-      }
-    }
-  `;
+  }
+`;
 
   // Correct mutation shape for your tenant: update(eventId: ..., input: { customFieldValues: [{ definitionKey, value }] })
   const UPDATE_EVENT_CF = `
@@ -85,23 +86,18 @@ exports.handler = async (req) => {
   try {
     // Resolve event node
     let node = null;
-    if (qpLegacyId) {
-      const d = await gql(GET_EVENT_BY_LEGACY_ID, { legacyId: qpLegacyId });
-      node = (d && d.events && d.events.edges && d.events.edges[0] && d.events.edges[0].node) || null;
-    } else {
-      const idToUse = qpEventId || eventIdFromPayload;
-      if (!idToUse) return resp(400, { error: "No event id. Use ?eventId=<GraphQL ID> or ?legacyId=<legacyId>." });
-      const d = await gql(GET_EVENT_BY_ID, { id: idToUse });
-      node = (d && d.events && d.events.edges && d.events.edges[0] && d.events.edges[0].node) || null;
-    }
+if (resolver === "id") {
+  const d = await gql(GET_EVENT_BY_ID, { id: resolverValue });
+  node = (d && d.events && d.events.edges && d.events.edges[0] && d.events.edges[0].node) || null;
+} else {
+  const d = await gql(GET_EVENT_BY_CODE, { code: resolverValue });
+  node = (d && d.events && d.events.edges && d.events.edges[0] && d.events.edges[0].node) || null;
+}
     if (!node) return resp(404, { error: "Event not found" });
 
     // Build public URL (prefer legacyId, then code, then id)
-    const base = SITE_BASE || urlObj.origin;
-    let publicUrl = "";
-    if (node.legacyId) publicUrl = `${base}/?legacyId=${encodeURIComponent(node.legacyId)}`;
-    else if (node.code) publicUrl = `${base}/e/${encodeURIComponent(node.code)}`;
-    else publicUrl = `${base}/?id=${encodeURIComponent(node.id)}`;
+const base = SITE_BASE || urlObj.origin;
+const publicUrl = `${base}/?id=${encodeURIComponent(node.id)}`;
 
     // Update custom field using definitionKey
     const result = await gql(UPDATE_EVENT_CF, {
