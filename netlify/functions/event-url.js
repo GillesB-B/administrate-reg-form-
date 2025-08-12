@@ -1,9 +1,11 @@
 // netlify/functions/event-url.js
+// CommonJS export to avoid ESM issues on Netlify
 exports.handler = async (req) => {
   const ORIGIN = process.env.ALLOWED_ORIGIN || "*";
   const endpoint = process.env.ADMINISTRATE_GRAPHQL_ENDPOINT;
-  const token = process.env.ADMINISTRATE_API_TOKEN; // access token (we can add refresh later)
+  const token = process.env.ADMINISTRATE_API_TOKEN; // current access token
   const SITE_BASE = process.env.PUBLIC_SITE_BASE || "";
+  const PUBLIC_URL_CF_DEFINITION_KEY = process.env.PUBLIC_URL_CF_DEFINITION_KEY; // <-- set this in Netlify
 
   const resp = (status, body) => ({
     statusCode: status,
@@ -17,20 +19,23 @@ exports.handler = async (req) => {
   if (!endpoint || !token) {
     return resp(500, { error: "Missing ADMINISTRATE_GRAPHQL_ENDPOINT or ADMINISTRATE_API_TOKEN" });
   }
+  if (!PUBLIC_URL_CF_DEFINITION_KEY) {
+    return resp(500, { error: "Missing PUBLIC_URL_CF_DEFINITION_KEY env var (custom field definitionKey/ID)" });
+  }
 
-  // Parse JSON body (webhook) + allow manual test via query params
+  // Parse payload (webhook) and query params for manual testing
   let payload = {};
   try { payload = JSON.parse(req.body || "{}"); } catch {}
-  const url = new URL(req.rawUrl || `https://example.com${req.path}?${req.queryStringParameters || ""}`);
-  const qpEventId = url.searchParams.get("eventId");
-  const qpLegacyId = url.searchParams.get("legacyId");
+  const urlObj = new URL(req.rawUrl || `https://example.com${req.path}?${req.queryStringParameters || ""}`);
+  const qpEventId = urlObj.searchParams.get("eventId");
+  const qpLegacyId = urlObj.searchParams.get("legacyId");
 
   const eventIdFromPayload =
-    payload?.event?.id ||
-    payload?.payload?.event?.id ||
-    payload?.entity?.id ||
-    payload?.data?.event?.id ||
-    payload?.id ||
+    (payload && (payload.event && payload.event.id)) ||
+    (payload && payload.payload && payload.payload.event && payload.payload.event.id) ||
+    (payload && payload.entity && payload.entity.id) ||
+    (payload && payload.data && payload.data.event && payload.data.event.id) ||
+    payload.id ||
     null;
 
   async function gql(query, variables) {
@@ -63,52 +68,60 @@ exports.handler = async (req) => {
     }
   `;
 
-  // ✅ Use event.update, not training{...}
-const UPDATE_EVENT_CF = `
-  mutation UpdateEventCF($eventId: ID!, $definitionKey: ID!, $value: String!) {
-    event {
-      update(eventId: $eventId, input: {
-        customFieldValues: [{ definitionKey: $definitionKey, value: $value }]
-      }) {
-        event { id }
-        errors { label message value }
+  // Correct mutation shape for your tenant: update(eventId: ..., input: { customFieldValues: [{ definitionKey, value }] })
+  const UPDATE_EVENT_CF = `
+    mutation UpdateEventCF($eventId: ID!, $definitionKey: ID!, $value: String!) {
+      event {
+        update(eventId: $eventId, input: {
+          customFieldValues: [{ definitionKey: $definitionKey, value: $value }]
+        }) {
+          event { id }
+          errors { label message value }
+        }
       }
     }
-  }
-`;
+  `;
 
   try {
-    // Resolve event
+    // Resolve event node
     let node = null;
     if (qpLegacyId) {
       const d = await gql(GET_EVENT_BY_LEGACY_ID, { legacyId: qpLegacyId });
-      node = d?.events?.edges?.[0]?.node || null;
+      node = (d && d.events && d.events.edges && d.events.edges[0] && d.events.edges[0].node) || null;
     } else {
       const idToUse = qpEventId || eventIdFromPayload;
       if (!idToUse) return resp(400, { error: "No event id. Use ?eventId=<GraphQL ID> or ?legacyId=<legacyId>." });
       const d = await gql(GET_EVENT_BY_ID, { id: idToUse });
-      node = d?.events?.edges?.[0]?.node || null;
+      node = (d && d.events && d.events.edges && d.events.edges[0] && d.events.edges[0].node) || null;
     }
     if (!node) return resp(404, { error: "Event not found" });
 
-    // Build public URL
-    const base = SITE_BASE || url.origin;
+    // Build public URL (prefer legacyId, then code, then id)
+    const base = SITE_BASE || urlObj.origin;
     let publicUrl = "";
     if (node.legacyId) publicUrl = `${base}/?legacyId=${encodeURIComponent(node.legacyId)}`;
     else if (node.code) publicUrl = `${base}/e/${encodeURIComponent(node.code)}`;
     else publicUrl = `${base}/?id=${encodeURIComponent(node.id)}`;
 
-    // Write to your Event custom field (API name must match your setup)
-const up = await gql(UPDATE_EVENT_CF, {
-  eventId: node.id,
-  definitionKey: process.env.PUBLIC_URL_CF_DEFINITION_KEY, // <-- uses your env var
-  value: publicUrl
-});
-const errs = up?.event?.update?.errors;
-    const errs = up?.event?.update?.errors;
-    if (errs && errs.length) return resp(400, { error: "Custom field update error", details: errs, publicUrl });
+    // Update custom field using definitionKey
+    const result = await gql(UPDATE_EVENT_CF, {
+      eventId: node.id,
+      definitionKey: PUBLIC_URL_CF_DEFINITION_KEY,
+      value: publicUrl
+    });
+    const update = result && result.event && result.event.update;
+    const errors = update && update.errors;
+    if (errors && errors.length) {
+      return resp(400, { error: "Custom field update error", details: errors, publicUrl });
+    }
 
-    return resp(200, { status: "success", eventId: node.id, legacyId: node.legacyId, code: node.code, publicUrl });
+    return resp(200, {
+      status: "success",
+      eventId: node.id,
+      legacyId: node.legacyId,
+      code: node.code,
+      publicUrl
+    });
   } catch (e) {
     return resp(500, { error: String(e) });
   }
